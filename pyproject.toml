@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-message-bus"
+version = "0.1.0"
+description = "Lightweight agent-to-agent messaging with priority routing, TTL, dead letter queues, and delivery confirmation"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "FiAgent Team" },
+]
+keywords = ["agent", "messaging", "swarm", "multi-agent", "message-bus", "async"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/fiagent/agent-message-bus"
+Repository = "https://github.com/fiagent/agent-message-bus"
+"Bug Tracker" = "https://github.com/fiagent/agent-message-bus/issues"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
