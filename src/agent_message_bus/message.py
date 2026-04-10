@@ -54,6 +54,8 @@ class Message:
     expires_at: Optional[datetime] = field(default=None)
     delivery_status: DeliveryStatus = field(default=DeliveryStatus.PENDING)
     delivery_attempts: int = field(default=0)
+    correlation_id: Optional[str] = field(default=None)  # Links request/response pairs
+    is_response: bool = field(default=False)  # True for reply/reply messages
 
     def __post_init__(self):
         """Compute expiration time if TTL is set."""

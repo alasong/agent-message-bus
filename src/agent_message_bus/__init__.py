@@ -7,9 +7,10 @@ Features:
 - Dead letter queue for failed deliveries
 - Delivery confirmation
 - Broadcast and point-to-point messaging
+- Pluggable storage backend (InMemory, Redis, etc.)
 - Async-first with sync compatibility
 
-Zero external dependencies.
+Zero external dependencies (Redis backend is optional).
 
 Example:
     >>> from agent_message_bus import MessageBus, MessagePriority
@@ -22,6 +23,7 @@ Example:
     {'task': 'compute'}
 """
 
+from agent_message_bus.backend import Backend, InMemoryBackend
 from agent_message_bus.bus import MessageBus
 from agent_message_bus.message import (
     DeliveryStatus,
@@ -30,9 +32,11 @@ from agent_message_bus.message import (
 )
 from agent_message_bus.router import MessageRouter
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
+    "Backend",
+    "InMemoryBackend",
     "Message",
     "MessagePriority",
     "DeliveryStatus",

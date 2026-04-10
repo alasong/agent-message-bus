@@ -288,6 +288,43 @@ class TestMessageBus:
         await bus.handle_failed_delivery(msg)
         assert msg.delivery_status == DeliveryStatus.DEAD_LETTER
 
+    async def test_concurrent_send_and_receive_no_message_loss(self):
+        """Stress test: concurrent sends to same agent should not lose any messages.
+
+        The race condition exists because send() enqueues then sets event separately.
+        A waiting receive() could clear the event between sends, missing the signal
+        for a message that was already enqueued. This test verifies the fix: every
+        enqueued message reliably triggers the event under the same lock.
+        """
+        import asyncio
+        bus = MessageBus()
+        bus.register_agent("receiver")
+        for i in range(100):
+            bus.register_agent(f"sender_{i}")
+
+        # Fire many sends concurrently, while a consumer drains
+        send_tasks = [bus.send(f"sender_{i}", "receiver", {"i": i}) for i in range(100)]
+
+        received = []
+        stop_event = asyncio.Event()
+
+        async def consumer():
+            while not stop_event.is_set():
+                msg = await bus.receive("receiver", timeout=0.5)
+                if msg is not None:
+                    received.append(msg.content)
+
+        async def producer():
+            await asyncio.gather(*send_tasks)
+
+        consumer_task = asyncio.create_task(consumer())
+        await producer()
+        await asyncio.sleep(0.1)  # let consumer drain
+        stop_event.set()
+        await consumer_task
+
+        assert len(received) == 100
+
     async def test_delivery_confirmation(self):
         bus = MessageBus()
         bus.register_agent("a")
@@ -298,5 +335,176 @@ class TestMessageBus:
         msg = await bus.receive("b", timeout=1.0)
         assert msg is not None
 
+        # receive marks as delivered but NOT yet confirmed
+        confirmed = await bus.check_delivery_confirmation(msg_id)
+        assert confirmed is False
+
+        # explicit confirm
+        await bus.confirm_delivery("b", msg_id)
         confirmed = await bus.check_delivery_confirmation(msg_id)
         assert confirmed is True
+
+    async def test_broadcast_unique_message_ids(self):
+        """Each broadcast target should get a unique message_id copy."""
+        bus = MessageBus()
+        bus.register_agent("sender")
+        bus.register_agent("r1")
+        bus.register_agent("r2")
+
+        msg_id = await bus.broadcast("sender", {"event": "hello"})
+
+        msg1 = await bus.receive("r1", timeout=1.0)
+        msg2 = await bus.receive("r2", timeout=1.0)
+
+        assert msg1 is not None
+        assert msg2 is not None
+        # Each target gets its own unique message_id
+        assert msg1.message_id != msg2.message_id
+        # The returned msg_id from broadcast is the first target's
+        assert msg_id == msg1.message_id
+
+    async def test_delivery_confirmation_not_tracked_by_default(self):
+        """Messages sent without require_confirmation should not have confirmation tracking."""
+        bus = MessageBus()
+        bus.register_agent("a")
+        bus.register_agent("b")
+
+        msg_id = await bus.send("a", "b", {"task": "x"})
+        await bus.receive("b", timeout=1.0)
+
+        # Not tracked, returns None
+        confirmed = await bus.check_delivery_confirmation(msg_id)
+        assert confirmed is None
+
+    async def test_request_response_basic(self):
+        """Request-response pattern: send request, await reply on dedicated channel."""
+        bus = MessageBus()
+        bus.register_agent("client")
+        bus.register_agent("server")
+
+        # Client sends request and awaits response
+        req_id = await bus.request("client", "server", {"query": "sum", "values": [1, 2, 3]}, timeout=1.0)
+
+        # Server receives request
+        msg = await bus.receive("server", timeout=1.0)
+        assert msg is not None
+        assert msg.content == {"query": "sum", "values": [1, 2, 3]}
+
+        # Server sends reply back
+        await bus.reply("server", "client", req_id, {"result": 6})
+
+        # Client receives response
+        response = await bus.receive_response("client", req_id, timeout=1.0)
+        assert response is not None
+        assert response.content == {"result": 6}
+
+    async def test_request_response_timeout(self):
+        """Request-response times out when no reply arrives."""
+        bus = MessageBus()
+        bus.register_agent("client")
+        bus.register_agent("server")
+
+        req_id = await bus.request("client", "server", {"data": "test"}, timeout=0.5)
+
+        # No reply sent — should timeout
+        response = await bus.receive_response("client", req_id, timeout=0.1)
+        assert response is None
+
+    async def test_request_response_multiple_requests(self):
+        """Multiple concurrent requests should not mix up responses."""
+        bus = MessageBus()
+        bus.register_agent("c1")
+        bus.register_agent("c2")
+        bus.register_agent("server")
+
+        req1 = await bus.request("c1", "server", {"from": "c1"}, timeout=1.0)
+        req2 = await bus.request("c2", "server", {"from": "c2"}, timeout=1.0)
+
+        # Server processes in order
+        await bus.receive("server", timeout=1.0)
+        await bus.receive("server", timeout=1.0)
+
+        await bus.reply("server", "c2", req2, {"reply_to": "c2"})
+        await bus.reply("server", "c1", req1, {"reply_to": "c1"})
+
+        resp1 = await bus.receive_response("c1", req1, timeout=1.0)
+        resp2 = await bus.receive_response("c2", req2, timeout=1.0)
+
+        assert resp1.content == {"reply_to": "c1"}
+        assert resp2.content == {"reply_to": "c2"}
+
+
+# --- Agent Metadata Tests ---
+
+
+@pytest.mark.asyncio
+class TestAgentMetadata:
+    async def test_register_agent_with_metadata(self):
+        """Register an agent with metadata and retrieve it."""
+        bus = MessageBus()
+        bus.register_agent("explorer", metadata={"role": "search", "version": "1.0"})
+        meta = bus.get_agent_metadata("explorer")
+        assert meta == {"role": "search", "version": "1.0"}
+
+    async def test_register_agent_without_metadata(self):
+        """Backwards compatible: register without metadata defaults to empty dict."""
+        bus = MessageBus()
+        bus.register_agent("agent_1")
+        meta = bus.get_agent_metadata("agent_1")
+        assert meta == {}
+
+    async def test_get_agent_metadata_unknown_agent(self):
+        """get_agent_metadata for an unknown agent returns empty dict."""
+        bus = MessageBus()
+        bus.register_agent("a")
+        meta = bus.get_agent_metadata("unknown")
+        assert meta == {}
+
+    async def test_list_agents(self):
+        """list_agents returns list of IDs by default."""
+        bus = MessageBus()
+        bus.register_agent("alpha")
+        bus.register_agent("beta")
+        agents = bus.list_agents()
+        assert sorted(agents) == ["alpha", "beta"]
+
+    async def test_list_agents_with_metadata(self):
+        """list_agents(include_metadata=True) returns dict with metadata."""
+        bus = MessageBus()
+        bus.register_agent("alpha", metadata={"role": "search"})
+        bus.register_agent("beta")
+        result = bus.list_agents(include_metadata=True)
+        assert result == {
+            "alpha": {"role": "search"},
+            "beta": {},
+        }
+
+    async def test_unregister_agent_clears_metadata(self):
+        """Unregistering an agent removes its metadata."""
+        bus = MessageBus()
+        bus.register_agent("temp", metadata={"role": "worker"})
+        bus.unregister_agent("temp")
+        meta = bus.get_agent_metadata("temp")
+        assert meta == {}
+
+    async def test_reregister_agent_replaces_metadata(self):
+        """Re-registering an agent replaces its metadata."""
+        bus = MessageBus()
+        bus.register_agent("worker", metadata={"role": "search"})
+        bus.register_agent("worker", metadata={"role": "execute"})
+        meta = bus.get_agent_metadata("worker")
+        assert meta == {"role": "execute"}
+
+    async def test_stats_include_agent_count(self):
+        """get_stats includes registered agent count."""
+        bus = MessageBus(max_delivery_attempts=5, default_ttl=120.0)
+        bus.register_agent("a", metadata={"role": "client"})
+        bus.register_agent("b")
+        await bus.send("a", "b", {"data": "test"})
+
+        stats = bus.get_stats()
+        assert stats["registered_agents"] == 2
+        assert stats["total_pending_messages"] == 1
+        assert stats["dead_letter_count"] == 0
+        assert stats["max_delivery_attempts"] == 5
+        assert stats["default_ttl"] == 120.0

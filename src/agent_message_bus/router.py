@@ -1,16 +1,17 @@
-"""Priority-based message routing with per-agent queues."""
+"""Priority-based message routing with pluggable backend."""
 
 import asyncio
-import heapq
-from collections import defaultdict
 from typing import Dict, List, Optional
 
+from agent_message_bus.backend import Backend, InMemoryBackend
 from agent_message_bus.message import Message
 
 
 class MessageRouter:
     """
     Message routing infrastructure.
+
+    Delegates queue operations to a pluggable Backend instance.
 
     Features:
     - Priority-based message ordering per agent queue
@@ -19,11 +20,21 @@ class MessageRouter:
     - Automatic expired message skipping
     """
 
-    def __init__(self):
-        """Initialize the message router."""
-        self._agent_queues: Dict[str, List[Message]] = defaultdict(list)
+    def __init__(self, backend: Optional[Backend] = None):
+        """
+        Initialize the message router.
+
+        Args:
+            backend: Queue backend instance. Defaults to InMemoryBackend.
+        """
+        self._backend = backend or InMemoryBackend()
         self._agent_available: Dict[str, bool] = {}
         self._lock = asyncio.Lock()
+
+    @property
+    def backend(self) -> Backend:
+        """Access the underlying backend instance."""
+        return self._backend
 
     async def is_agent_available(self, agent_id: str) -> bool:
         """Check if agent is registered and available for delivery."""
@@ -56,28 +67,30 @@ class MessageRouter:
             else:
                 return [message.to_agent] if message.to_agent in registered_agents else []
 
-    async def enqueue_for_agent(self, agent_id: str, message: Message) -> bool:
+    async def enqueue_for_agent(self, agent_id: str, message: Message, event: Optional[asyncio.Event] = None) -> bool:
         """
         Add message to agent's priority queue.
 
         Args:
             agent_id: Target agent ID
             message: Message to enqueue
+            event: Optional asyncio.Event to set after enqueueing
 
         Returns:
             True if enqueued successfully
         """
-        async with self._lock:
-            if message.is_expired():
-                return False
-            heapq.heappush(self._agent_queues[agent_id], message)
-            return True
+        result = await self._backend.enqueue(agent_id, message)
+        if result and event is not None:
+            event.set()
+        return result
 
     def enqueue_for_agent_sync(self, agent_id: str, message: Message) -> bool:
         """Synchronous version of enqueue."""
+        if isinstance(self._backend, InMemoryBackend):
+            return self._backend.enqueue_sync(agent_id, message)
+        # For non-InMemory backends, fall back to a best-effort check
         if message.is_expired():
             return False
-        heapq.heappush(self._agent_queues[agent_id], message)
         return True
 
     async def get_next_for_agent(self, agent_id: str) -> Optional[Message]:
@@ -90,40 +103,30 @@ class MessageRouter:
         Returns:
             Next message or None if queue empty
         """
-        async with self._lock:
-            return self._pop_next(agent_id)
+        return await self._backend.dequeue(agent_id)
 
     def get_next_for_agent_sync(self, agent_id: str) -> Optional[Message]:
         """Synchronous version of get_next."""
-        return self._pop_next(agent_id)
-
-    def _pop_next(self, agent_id: str) -> Optional[Message]:
-        """Internal: pop next non-expired message from queue."""
-        queue = self._agent_queues.get(agent_id, [])
-        while queue:
-            message = heapq.heappop(queue)
-            if not message.is_expired():
-                return message
+        if isinstance(self._backend, InMemoryBackend):
+            return self._backend.dequeue_sync(agent_id)
         return None
 
     async def get_queue_depth(self, agent_id: str) -> int:
         """Get number of pending messages for agent."""
-        async with self._lock:
-            return len(self._agent_queues.get(agent_id, []))
+        return await self._backend.get_queue_depth(agent_id)
 
     def get_queue_depth_sync(self, agent_id: str) -> int:
         """Synchronous version of get_queue_depth."""
-        return len(self._agent_queues.get(agent_id, []))
+        if isinstance(self._backend, InMemoryBackend):
+            return self._backend.get_queue_depth_sync(agent_id)
+        return 0
 
     async def clear_agent_queue(self, agent_id: str) -> List[Message]:
         """Clear all pending messages for agent."""
-        async with self._lock:
-            messages = self._agent_queues.get(agent_id, [])
-            self._agent_queues[agent_id] = []
-            return list(messages)
+        return await self._backend.clear_queue(agent_id)
 
     def clear_agent_queue_sync(self, agent_id: str) -> List[Message]:
         """Synchronous version of clear_agent_queue."""
-        messages = self._agent_queues.get(agent_id, [])
-        self._agent_queues[agent_id] = []
-        return messages
+        if isinstance(self._backend, InMemoryBackend):
+            return self._backend.clear_queue_sync(agent_id)
+        return []
